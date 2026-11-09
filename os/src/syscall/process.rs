@@ -39,7 +39,28 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
 }
 
 // TODO: implement the syscall
-pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
-    trace!("kernel: sys_trace");
-    -1
+/// Read/write a byte or query the current task's syscall count.
+pub fn sys_trace(
+    trace_request: usize,
+    id: usize,
+    data: usize,
+) -> isize {
+    match trace_request {
+        // id 是地址，读取该地址处的一个字节。
+        0 => unsafe { (id as *const u8).read() as isize },
+
+        // 把 data 的低 8 位写入 id 指定的地址。
+        1 => {
+            unsafe {
+                (id as *mut u8).write(data as u8);
+            }
+            0
+        }
+
+        // id 是系统调用编号。
+        2 => crate::task::get_syscall_count(id),
+
+        // 不支持的请求。
+        _ => -1,
+    }
 }
