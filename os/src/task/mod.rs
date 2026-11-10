@@ -17,6 +17,12 @@ mod task;
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+/// Number of sycall IDs tracked for each task
+const MAX_SYSCALL_NUM: usize = 512;
+static SYSCALL_COUNTS: UPSafeCell<[[usize; MAX_SYSCALL_NUM];MAX_APP_NUM]> = 
+    unsafe {
+        UPSafeCell::new([[0;MAX_SYSCALL_NUM];MAX_APP_NUM])
+    };
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
@@ -54,7 +60,6 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
-            syscall_times: [0; 512],
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -173,22 +178,24 @@ pub fn exit_current_and_run_next() {
 
 /// Record a syscall made by the current task
 pub fn record_syscall(syscall_id: usize){
-    let mut inner = TASK_MANAGER.inner.exclusive_access();
-    let current = inner.current_task;
-    if let Some(count) = inner.tasks[current]
-        .syscall_times
-        .get_mut(syscall_id)
-        {
-            *count += 1;
-        }
+    let current = {
+        let inner = TASK_MANAGER.inner.exclusive_access();
+        inner.current_task
+    };
+    let mut counts = SYSCALL_COUNTS.exclusive_access();
+    if let Some(count) = counts[current].get_mut(syscall_id) {
+        *count += 1;
+    }
 }
 
 /// Get the current task's syscall count
 pub fn get_syscall_count(syscall_id: usize) -> isize {
-    let inner = TASK_MANAGER.inner.exclusive_access();
-    let current = inner.current_task;
-    inner.tasks[current]
-        .syscall_times
+    let current = {
+        let inner = TASK_MANAGER.inner.exclusive_access();
+        inner.current_task
+    };
+    let counts = SYSCALL_COUNTS.exclusive_access();
+    counts[current]
         .get(syscall_id)
         .map(|count| *count as isize)
         .unwrap_or(-1)
