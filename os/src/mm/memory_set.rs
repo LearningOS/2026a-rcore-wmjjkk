@@ -233,6 +233,101 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    /// Map an anonymous user area if every page in the range is currently free.
+    pub fn map_user_area(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        if !start.aligned() || start >= end || !permission.contains(MapPermission::U) {
+            return false;
+        }
+
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        for vpn_num in start_vpn.0..end_vpn.0 {
+            let vpn = VirtPageNum(vpn_num);
+            if self
+                .page_table
+                .translate(vpn)
+                .map(|pte| pte.is_valid())
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+
+        self.insert_framed_area(start, end, permission);
+        true
+    }
+
+    /// Unmap a user framed area after validating the entire range.
+    pub fn unmap_framed_area(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        if !start.aligned() || start >= end {
+            return false;
+        }
+
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        for vpn_num in start_vpn.0..end_vpn.0 {
+            let vpn = VirtPageNum(vpn_num);
+            let pte = match self.page_table.translate(vpn) {
+                Some(pte) => pte,
+                None => return false,
+            };
+            if !pte.is_valid() || !pte.flags().contains(PTEFlags::U) {
+                return false;
+            }
+            let has_owned_frame = self.areas.iter().any(|area| {
+                area.map_type == MapType::Framed
+                    && area.vpn_range.get_start() <= vpn
+                    && vpn < area.vpn_range.get_end()
+                    && area.data_frames.contains_key(&vpn)
+            });
+            if !has_owned_frame {
+                return false;
+            }
+        }
+
+        let old_areas = core::mem::take(&mut self.areas);
+        let mut new_areas = Vec::with_capacity(old_areas.len() + 1);
+        for mut area in old_areas {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            let cut_start = if start_vpn > area_start { start_vpn } else { area_start };
+            let cut_end = if end_vpn < area_end { end_vpn } else { area_end };
+
+            if cut_start >= cut_end {
+                new_areas.push(area);
+                continue;
+            }
+
+            for vpn_num in cut_start.0..cut_end.0 {
+                area.unmap_one(&mut self.page_table, VirtPageNum(vpn_num));
+            }
+
+            let right_frames = area.data_frames.split_off(&cut_end);
+            if area_start < cut_start {
+                new_areas.push(MapArea {
+                    vpn_range: VPNRange::new(area_start, cut_start),
+                    data_frames: core::mem::take(&mut area.data_frames),
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                });
+            }
+            if cut_end < area_end {
+                new_areas.push(MapArea {
+                    vpn_range: VPNRange::new(cut_end, area_end),
+                    data_frames: right_frames,
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                });
+            }
+        }
+        self.areas = new_areas;
+        true
+    }
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
