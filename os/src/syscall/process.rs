@@ -6,7 +6,7 @@ use crate::{
     mm::{translated_refmut, translated_str},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+        suspend_current_and_run_next, TaskControlBlock,
     },
 };
 
@@ -67,7 +67,11 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel::pid[{}] sys_waitpid [{}]", current_task().unwrap().pid.0, pid);
+    trace!(
+        "kernel::pid[{}] sys_waitpid [{}]",
+        current_task().unwrap().pid.0,
+        pid
+    );
     let task = current_task().unwrap();
     // find a child process
 
@@ -143,19 +147,33 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    let token = current_user_token();
+    let name = translated_str(token, path);
+    let data = match get_app_data_by_name(&name) {
+        Some(data) => data,
+        None => return -1,
+    }; // 找到这个程序的ELF文件字节
+    let parent = current_task().unwrap();
+    let child = Arc::new(TaskControlBlock::new(data));
+    let pid = child.getpid();
+    {
+        let mut child_inner = child.inner_exclusive_access();
+        child_inner.parent = Some(Arc::downgrade(&parent));
+    }
+    parent.inner_exclusive_access().children.push(child.clone());
+    add_task(child);
+    pid as isize
 }
 
 // YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_set_priority(prio: isize) -> isize {
+    if prio < 2 {
+        return -1;
+    }
+    let Some(task) = current_task() else {
+        return -1;
+    };
+    task.inner_exclusive_access().priority = prio as usize;
+    prio
 }
