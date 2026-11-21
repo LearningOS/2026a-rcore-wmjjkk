@@ -1,14 +1,14 @@
 //! Process management syscalls
-use alloc::sync::Arc;
-
 use crate::{
+    config::PAGE_SIZE,
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
+    mm::{copy_to_user, translated_refmut, translated_str, MapPermission, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next, TaskControlBlock,
     },
 };
+use alloc::sync::Arc;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -109,30 +109,93 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let now_us = crate::timer::get_time_us();
+    let time = TimeVal {
+        sec: now_us / 1_000_000,
+        usec: now_us % 1_000_000,
+    };
+    let word_size = core::mem::size_of::<usize>();
+    let mut time_bytes = [0u8; core::mem::size_of::<TimeVal>()];
+    time_bytes[..word_size].copy_from_slice(&time.sec.to_ne_bytes());
+    time_bytes[word_size..].copy_from_slice(&time.usec.to_ne_bytes());
+    if copy_to_user(current_user_token(), ts.cast(), &time_bytes) {
+        0
+    } else {
+        -1
+    }
+}
+
+const USER_VA_END: usize = 1usize << 38;
+
+fn mmap_permission(prot: usize) -> Option<MapPermission> {
+    if prot == 0 || (prot & !0x7) != 0 {
+        return None;
+    }
+    let mut permission = MapPermission::U;
+    if prot & 1 != 0 {
+        permission |= MapPermission::R;
+    }
+    if prot & 2 != 0 {
+        permission |= MapPermission::W;
+    }
+    if prot & 4 != 0 {
+        permission |= MapPermission::X;
+    }
+    Some(permission)
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    if start % PAGE_SIZE != 0 || len == 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return -1,
+    };
+    if start >= USER_VA_END || end > USER_VA_END {
+        return -1;
+    }
+    let permission = match mmap_permission(port) {
+        Some(permission) => permission,
+        None => return -1,
+    };
+    let task = current_task().unwrap();
+    let mapped = task.inner_exclusive_access().memory_set.map_user_area(
+        VirtAddr::from(start),
+        VirtAddr::from(end),
+        permission,
     );
-    -1
+    if mapped {
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    if start % PAGE_SIZE != 0 || len == 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return -1,
+    };
+    if start >= USER_VA_END || end > USER_VA_END {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let unmapped = task
+        .inner_exclusive_access()
+        .memory_set
+        .unmap_framed_area(VirtAddr::from(start), VirtAddr::from(end));
+    if unmapped {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -157,11 +220,16 @@ pub fn sys_spawn(path: *const u8) -> isize {
     let parent = current_task().unwrap();
     let child = Arc::new(TaskControlBlock::new(data));
     let pid = child.getpid();
+    let parent_stride = {
+        let mut parent_inner = parent.inner_exclusive_access();
+        parent_inner.children.push(child.clone());
+        parent_inner.stride
+    };
     {
         let mut child_inner = child.inner_exclusive_access();
         child_inner.parent = Some(Arc::downgrade(&parent));
+        child_inner.stride = parent_stride;
     }
-    parent.inner_exclusive_access().children.push(child.clone());
     add_task(child);
     pid as isize
 }

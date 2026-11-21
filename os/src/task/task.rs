@@ -69,8 +69,10 @@ pub struct TaskControlBlockInner {
     /// Program break
     pub program_brk: usize,
 
-    ///
+    /// Scheduling priority (minimum 2, default 16)
     pub priority: usize,
+    /// Current stride value for stride scheduling
+    pub stride: usize,
 }
 
 impl TaskControlBlockInner {
@@ -122,6 +124,7 @@ impl TaskControlBlock {
                     heap_bottom: user_sp,
                     program_brk: user_sp,
                     priority: 16,
+                    stride: 0,
                 })
             },
         };
@@ -152,8 +155,10 @@ impl TaskControlBlock {
         inner.memory_set = memory_set;
         // update trap_cx ppn
         inner.trap_cx_ppn = trap_cx_ppn;
-        // initialize base_size
+        // initialize base_size and heap bounds
         inner.base_size = user_sp;
+        inner.heap_bottom = user_sp;
+        inner.program_brk = user_sp;
         // initialize trap_cx
         let trap_cx = inner.get_trap_cx();
         *trap_cx = TrapContext::app_init_context(
@@ -196,6 +201,7 @@ impl TaskControlBlock {
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
                     priority: 16,
+                    stride: parent_inner.stride,
                 })
             },
         });

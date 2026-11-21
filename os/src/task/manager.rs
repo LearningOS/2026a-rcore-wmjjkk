@@ -1,5 +1,6 @@
 //!Implementation of [`TaskManager`]
 use super::TaskControlBlock;
+use crate::config::BIG_STRIDE;
 use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -23,7 +24,25 @@ impl TaskManager {
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        // 1. 遍历 ready_queue，按有符号差值找 stride 最小的下标（兼容无符号回绕溢出）
+        let (idx, _) = self
+            .ready_queue
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let stride_a = a.inner_exclusive_access().stride;
+                let stride_b = b.inner_exclusive_access().stride;
+                (stride_a.wrapping_sub(stride_b) as isize).cmp(&0)
+            })?;
+        // 2. 从队列里取出来
+        let task = self.ready_queue.remove(idx)?;
+        // 3. 选中它，累加一次 pass（使用 wrapping_add 允许无符号自然回绕）
+        {
+            let mut inner = task.inner_exclusive_access();
+            let pass = BIG_STRIDE / inner.priority;
+            inner.stride = inner.stride.wrapping_add(pass);
+        }
+        Some(task)
     }
 }
 

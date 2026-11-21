@@ -21,3 +21,5 @@ pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
 pub const CLOCK_FREQ: usize = 12500000;
 /// the physical memory end
 pub const MEMORY_END: usize = 0x88000000;
+/// stride 调度的大常数（不超过 isize::MAX，保证回绕时有符号差值比较成立，且最大优先级步长仍 >= 1）
+pub const BIG_STRIDE: usize = isize::MAX as usize;
