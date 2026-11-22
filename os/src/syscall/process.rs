@@ -3,8 +3,9 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{copy_to_user_val, translated_refmut, translated_str, MapPermission, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
@@ -12,7 +13,7 @@ use crate::{
 };
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
@@ -105,30 +106,83 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let now_us = crate::timer::get_time_us();
+    let time = TimeVal{
+        sec: now_us / 1_000_000,
+        usec: now_us % 1_000_000,
+    };
+    if copy_to_user_val(current_user_token(),ts,&time) { 
+        0 
+    } else {
+        -1
+    }
+}
+
+fn parse_user_range(start: usize, len: usize) -> Option<(VirtAddr, VirtAddr)> {
+    const USER_VA_END: usize = 1usize << 38;
+    if start % PAGE_SIZE != 0 || len == 0 {
+        return None;
+    }
+    let end = start.checked_add(len)?;
+    if start >= USER_VA_END || end > USER_VA_END {
+        return None;
+    }
+    Some((VirtAddr::from(start), VirtAddr::from(end)))
+}
+
+fn mmap_permission(prot: usize) -> Option<MapPermission> {
+    if prot == 0 || (prot & !0x7) != 0 {
+        return None;
+    }
+    let mut permission = MapPermission::U;
+    if prot & 1 != 0 {
+        permission |= MapPermission::R;
+    }
+    if prot & 2 != 0 {
+        permission |= MapPermission::W;
+    }
+    if prot & 4 != 0 {
+        permission |= MapPermission::X;
+    }
+    Some(permission)
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    let Some((start_va, end_va)) = parse_user_range(start, len) else {
+        return -1;
+    };
+    let Some(permission) = mmap_permission(port) else {
+        return -1;
+    };
+    let task = current_task().unwrap();
+    let mapped = task
+        .inner_exclusive_access()
+        .memory_set
+        .map_user_area(start_va, end_va, permission);
+    if mapped {
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    let Some((start_va, end_va)) = parse_user_range(start, len) else {
+        return -1;
+    };
+    let task = current_task().unwrap();
+    let unmapped = task
+        .inner_exclusive_access()
+        .memory_set
+        .unmap_framed_area(start_va, end_va);
+    if unmapped {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -143,12 +197,18 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY)
+else {
+    return -1;
+    };
+    let all_data = app_inode.read_all();
+    let new_task = current_task().unwrap().spawn(all_data.as_slice());
+    let new_pid = new_task.pid.0;
+    add_task(new_task);
+    new_pid as isize
 }
 
 // YOUR JOB: Set task priority.
