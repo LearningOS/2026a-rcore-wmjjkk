@@ -1,5 +1,6 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::config::PAGE_SIZE;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -177,6 +178,58 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Safely copy a `#[repr(C)]` value into user space (handles cross-page writes).
+pub fn copy_to_user_val<T: Copy>(token: usize, dst: *mut T, val: &T) -> bool {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (val as *const T) as *const u8,
+            core::mem::size_of::<T>(),
+        )
+    };
+    copy_to_user(token, dst.cast(), bytes)
+}
+
+/// Safely copy bytes into user space after validating the entire target range.
+pub fn copy_to_user(token: usize, dst: *mut u8, src: &[u8]) -> bool {
+    let start = dst as usize;
+    let end = match start.checked_add(src.len()) {
+        Some(end) => end,
+        None => return false,
+    };
+    if src.is_empty() {
+        return true;
+    }
+    let page_table = PageTable::from_token(token);
+    let mut addr = start;
+    while addr < end {
+        let va = VirtAddr::from(addr);
+        if usize::from(va) != addr {
+            return false;
+        }
+        let pte = match page_table.translate(va.floor()) {
+            Some(pte) => pte,
+            None => return false,
+        };
+        if !pte.is_valid() || !pte.flags().contains(PTEFlags::U | PTEFlags::W) {
+            return false;
+        }
+        addr = core::cmp::min(end, addr + PAGE_SIZE - va.page_offset());
+    }
+    let mut addr = start;
+    let mut copied = 0;
+    while addr < end {
+        let va = VirtAddr::from(addr);
+        let pte = page_table.translate(va.floor()).unwrap();
+        let offset = va.page_offset();
+        let count = core::cmp::min(end - addr, PAGE_SIZE - offset);
+        let page_bytes = pte.ppn().get_bytes_array();
+        page_bytes[offset..offset + count].copy_from_slice(&src[copied..copied + count]);
+        addr += count;
+        copied += count;
+    }
+    true
 }
 
 /// Create String in kernel address space from u8 Array(end with 0) in other address space
